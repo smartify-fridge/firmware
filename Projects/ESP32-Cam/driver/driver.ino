@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME680.h>
+#include <DFRobot_LTR308.h>
 
 // Raspberry PI Network
 const char* ssid = "SmartFridge";
@@ -13,19 +14,22 @@ const char* password = "team2SmartFridge";
 WebServer server(80);
 
 // Image Frequency
-const int frequency = 15; // camera capture frequency in seconds
-const int flash_delay = 2000; // turns on flash and waits until X/2ms passes before and after capture
-const int transfer_frequency = 3; // attempt to transfer every Xs before connection closes
+const int capture_frequency = 50;  // camera capture attempt frequency in miliseconds
+const int successful_frequency = 20000; // capture attempt after successful capture in miliseconds
+const int flash_delay = 2000;      // turns on flash and waits until X/2ms passes before and after capture
+const int transfer_frequency = 3;  // attempt to transfer every Xs before connection closes
+int last_image_capture = 0;
 
 // Network Check Frequency
-const int wifi_check_frequency = 300; // Checks every Nms 
+const int wifi_check_frequency = 5000;  // Checks every Nms
 
 // Camera UID (#)
 int camera_num = 4;
 const int total_cams = 4;
 
 // Image Buffer
-uint8_t* image_buffer  = NULL;
+uint8_t* prior_image_buffer = NULL;
+uint8_t* image_buffer = NULL;
 size_t image_length = 0;
 SemaphoreHandle_t mutex;
 
@@ -33,38 +37,43 @@ SemaphoreHandle_t mutex;
 // The arrays are treated as a queue, where 0 <= i <= 100 and i -> 0 when i = 101
 // Data is coupled with image taking
 bool sensor_available = false;
-const int readings = 3;
+const int readings = 100;
 int current_reading = 0;
 bool completed_full = false;
-float temperature[readings]; // C
-float pressure[readings]; // hPa
-float humidity[readings]; // %
-float gas[readings]; // kOhms
+float temperature[readings];  // C
+float pressure[readings];     // hPa
+float humidity[readings];     // %
+float gas[readings];          // kOhms
+float min_lux = 35.0;
+float max_lux = 35.0;
+float current_lux = 0.0;
+float previous_lux[5];
+int lux_idx = 0;
 
 // Sensor & Wire
-TwoWire GRAVITY_WIRE = TwoWire(0);
+#define I2C_SDA 43
+#define I2C_SCL 44
+TwoWire GRAVITY_WIRE = TwoWire(1);
 Adafruit_BME680 bme(&GRAVITY_WIRE);
+DFRobot_LTR308 light;
 
 // LED Pin
-#define ONBOARD_LED       GPIO_NUM_3
+#define ONBOARD_LED GPIO_NUM_3
 // Camera pins
-#define XCLK_GPIO_NUM     5
-#define Y9_GPIO_NUM       4
-#define Y8_GPIO_NUM       6
-#define Y7_GPIO_NUM       7
-#define Y6_GPIO_NUM       14
-#define Y5_GPIO_NUM       17
-#define Y4_GPIO_NUM       21
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM       16
-#define VSYNC_GPIO_NUM    1
-#define HREF_GPIO_NUM     2
-#define PCLK_GPIO_NUM     15
-#define SIOD_GPIO_NUM     8
-#define SIOC_GPIO_NUM     9
-// BME Sensor
-#define I2C_SDA           43
-#define I2C_SCL           44
+#define XCLK_GPIO_NUM 5
+#define Y9_GPIO_NUM 4
+#define Y8_GPIO_NUM 6
+#define Y7_GPIO_NUM 7
+#define Y6_GPIO_NUM 14
+#define Y5_GPIO_NUM 17
+#define Y4_GPIO_NUM 21
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 16
+#define VSYNC_GPIO_NUM 1
+#define HREF_GPIO_NUM 2
+#define PCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 8
+#define SIOC_GPIO_NUM 9
 
 gpio_config_t setup_gpio_config() {
   gpio_config_t config;
@@ -77,8 +86,8 @@ gpio_config_t setup_gpio_config() {
   gpio_set_level(ONBOARD_LED, 0);
 
   // Start Sensor
-  GRAVITY_WIRE.begin(I2C_SDA, I2C_SCL);
-  if (!bme.begin(0x77)) { 
+  GRAVITY_WIRE.begin(I2C_SDA, I2C_SCL, 100000);
+  if (!bme.begin(0x77, true)) {
     Serial.println(F("No sensor detected"));
   } else {
     sensor_available = true;
@@ -86,7 +95,7 @@ gpio_config_t setup_gpio_config() {
     bme.setHumidityOversampling(BME680_OS_2X);
     bme.setPressureOversampling(BME680_OS_4X);
     bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320*C for 150 ms
+    bme.setGasHeater(320, 150);  // 320*C for 150 ms
   }
   return config;
 }
@@ -109,28 +118,38 @@ camera_config_t setup_camera_config() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = -1;
   config.pin_reset = -1;
+  
+  // Sharing I2C with light sensor
+  config.pin_sccb_sda  = -1;
+  config.pin_sccb_scl  = -1;
+  config.sccb_i2c_port = 0;
 
   config.xclk_freq_hz = 8000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_SXGA;
   config.jpeg_quality = 5;
   config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.println(F("Camera failed!"));
     exit(1);
-  }  
+  }
 
   // Flip camera orientation
-  sensor_t *s = esp_camera_sensor_get();
+  sensor_t* s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
-
   return config;
+}
+
+void setup_light_sensor() {    
+  while(!light.begin()){
+    Serial.println("Light Initialization failed!");
+    delay(100);
+  }
 }
 
 void setup_mDNS() {
@@ -138,7 +157,7 @@ void setup_mDNS() {
   while (!MDNS.begin(hostname)) {
     camera_num += 1;
     hostname = "cam" + String(camera_num);
-    if (camera_num > total_cams) camera_num = 1; // Reset on 5
+    if (camera_num > total_cams) camera_num = 1;  // Reset on 5
   }
 
   Serial.print(F("mDNS responder started: "));
@@ -150,13 +169,14 @@ void capture_sensor_reading() {
   if (!sensor_available) {
     Serial.println("[WARN] Failed to read. Reason: No sensor available");
   } else if (!bme.performReading()) {
-        Serial.println("[WARN] Failed to read. Reason: No sensor data");
+    Serial.println("[WARN] Failed to read. Reason: No sensor data");
   } else {
     temperature[current_reading] = bme.temperature;
     pressure[current_reading] = bme.pressure / 100;
     humidity[current_reading] = bme.humidity;
     gas[current_reading] = bme.gas_resistance / 1000.0;
 
+    /*
     Serial.print(F("Temperature = "));
     Serial.print(temperature[current_reading]);
     Serial.println(F(" *C"));
@@ -173,41 +193,44 @@ void capture_sensor_reading() {
     Serial.print(gas[current_reading]);
     Serial.println(F(" Kohms"));
     Serial.println("");
-
+    */
     completed_full = (current_reading == readings - 1) || completed_full;
     current_reading = (current_reading + 1) % readings;
   }
 }
 
 // Captures an image and sensor data when called
-void capture_image(void *pvParameters) {
+void capture_image(void* pvParameters) {
   while (1) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) {
-      if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {  
-        if (image_buffer != NULL) {
-          free(image_buffer);
-          image_buffer = NULL;
+    uint32_t light_level = light.getData();
+    Serial.print("Light level: ");
+    Serial.println(light.getLux(light_level));
+    current_lux = light.getLux(light_level);
+    if (current_lux > min_lux) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      if (fb) {
+        uint8_t* nb = (uint8_t*)ps_malloc(fb->len);
+        if (nb) {
+          memcpy(nb, fb->buf, fb->len);
+          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            Serial.println("Captured");
+            image_buffer = nb;
+            image_length = fb->len;
+            xSemaphoreGive(mutex);
+          } else {
+            free(nb);
+          }
         }
-
-        image_buffer = (uint8_t*)malloc(fb->len);
-        memcpy(image_buffer, fb->buf, fb->len);
-        image_length = fb->len;
-
-        xSemaphoreGive(mutex);
+        esp_camera_fb_return(fb);
+        last_image_capture = millis();
       }
-      
-      gpio_set_level(ONBOARD_LED, 1);
-      vTaskDelay(pdMS_TO_TICKS(flash_delay / 2));
-      esp_camera_fb_return(fb);
-      capture_sensor_reading();
-      vTaskDelay(pdMS_TO_TICKS(flash_delay / 2));
-      gpio_set_level(ONBOARD_LED, 0);
     }
 
-    // Wait for N seconds before the next capture
-    vTaskDelay(pdMS_TO_TICKS(frequency * 1000 - flash_delay)); 
-  }
+    lux_idx = (lux_idx + 1) % 5;
+    previous_lux[lux_idx] = current_lux;
+    capture_sensor_reading();
+    vTaskDelay(pdMS_TO_TICKS(capture_frequency));
+  }     
 }
 
 String array_to_json_str(float arr[]) {
@@ -224,17 +247,22 @@ String array_to_json_str(float arr[]) {
 
 void setup_server() {
   server.on("/image", []() {
-    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      if (image_buffer != NULL) {
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+      server.send(503, "text/plain", "Busy");
+      return;
+    }
+    if (image_buffer) {
+      if (millis() - last_image_capture >= 5000 || prior_image_buffer == NULL) {
+        prior_image_buffer = image_buffer;
+        Serial.println("New Image");
         server.send_P(200, "image/jpeg", (const char*)image_buffer, image_length);
       } else {
-        server.send(404, "text/plain", "No image captured yet");
+        Serial.println("Buffer Image");
+        server.send_P(200, "image/jpeg", (const char*)prior_image_buffer, image_length);
       }
-
-      xSemaphoreGive(mutex);
-    } else {
-      server.send(503, "text/plain", "Server busy");
     }
+    else server.send(404, "text/plain", "No image captured yet");
+    xSemaphoreGive(mutex);
   });
 
   server.on("/sensor/bulk", []() {
@@ -270,16 +298,38 @@ void setup_server() {
       server.send(404, "text/plain", "Sensor unavailable");
     }
   });
+
+  server.on("/sensor/lux", []() {
+    String json = "{";
+    json += "\"lux\":" + String(current_lux);
+    json += "}";
+
+    server.send(200, "application/json", json);
+  });
 }
 
 void setup() {
   Serial.begin(115200);
-  gpio_config_t gpio_config = setup_gpio_config();
+  delay(1000);
+  Wire.begin(SIOD_GPIO_NUM, SIOC_GPIO_NUM, 100000);
   camera_config_t camera_config = setup_camera_config();
+  setup_light_sensor();
+  gpio_config_t gpio_config = setup_gpio_config();
 
   mutex = xSemaphoreCreateMutex();
   xTaskCreate(capture_image, "capture_image", 8192, NULL, 5, NULL);
-
+  //WiFi.begin(ssid, password);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // disable modem sleep; helps with flaky AP links
+  WiFi.setAutoReconnect(true);
+  WiFi.onEvent([](WiFiEvent_t e, WiFiEventInfo_t info) {
+    if (e == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
+      Serial.printf("WiFi disconnected, reason %d\n", info.wifi_sta_disconnected.reason);
+    if (e == ARDUINO_EVENT_WIFI_STA_GOT_IP) {   // restart mDNS after (re)connect
+      MDNS.end();
+      MDNS.begin(("cam" + String(camera_num)).c_str());
+    }
+  });
   WiFi.begin(ssid, password);
   setup_mDNS();
   setup_server();
@@ -292,10 +342,10 @@ void loop() {
   static unsigned long last_wifi_check = 0;
   if (millis() - last_wifi_check > wifi_check_frequency) {
     wl_status_t status = WiFi.status();
-    if (status == WL_CONNECT_FAILED 
-        || status == WL_CONNECTION_LOST 
+    if (status == WL_CONNECT_FAILED
+        || status == WL_CONNECTION_LOST
         || status == WL_DISCONNECTED) {
-      WiFi.begin(ssid, password);
+      WiFi.reconnect();
     }
     last_wifi_check = millis();
   }
